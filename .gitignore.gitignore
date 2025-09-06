@@ -1,0 +1,22 @@
+# Archivos de entorno (¡NUNCA subir el .env real!)
+.env
+
+# Dependencias
+node_modules/
+
+# Archivos de logs
+logs
+*.log
+
+# Archivos temporales
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
