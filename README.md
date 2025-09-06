@@ -1,4 +1,4 @@
-# 🤖 AQUITA WhatsApp Bot
+# 🤖 .i. WhatsApp Bot
 
 Este bot automatiza el registro de usuarios, la afiliación de negocios y la recepción de streams para la plataforma AQUITA.
 
