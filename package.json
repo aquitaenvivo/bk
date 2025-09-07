@@ -12,7 +12,7 @@
     "mongodb",
     "api"
   ],
-  "author": "Tu Nombre",
+  "author": "ELS",
   "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
