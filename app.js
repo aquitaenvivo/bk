@@ -5,24 +5,22 @@ const axios = require('axios');
 const bodyParser = require('body-parser');
 
 // --- CONFIGURACIÓN ---
-// Es crucial que 'app' se defina inmediatamente después de las importaciones
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
 // Puerto (usado por Render)
-const PORT = process.env.PORT || 10000; // Render usa 10000 por defecto
+const PORT = process.env.PORT || 10000;
 
 // Tu token secreto para el endpoint admin (debe estar en Render ENV)
 const ADMIN_TOKEN = process.env.ADMIN_API_KEY;
 
 // Validación de variables críticas de entorno
 if (!ADMIN_TOKEN) {
-    console.error("❌ FALTA LA VARIABLE DE ENTORNO: ADMIN_API_KEY");
-    // process.exit(1); // Opcional: detener el inicio si es crítica
+    console.warn("⚠️ ADVERTENCIA: Falta la variable de entorno ADMIN_API_KEY. El endpoint /admin/register-user no estará protegido.");
 }
 
 // Conectar a MongoDB (usando variable de entorno)
-mongoose.connect(process.env.MONGODB_URI)
+mongoose.connect(process.env.MONGODB_URI, { /* Opciones de conexión */ })
     .then(() => console.log('✅ Conectado a MongoDB'))
     .catch(err => {
         console.error('❌ Error al conectar a MongoDB:', err);
@@ -41,17 +39,6 @@ const UserSchema = new mongoose.Schema({
 }, { timestamps: true }); // Añade createdAt y updatedAt
 
 const User = mongoose.model('User', UserSchema);
-
-// Modelo de Stream (Transmisiones)
-// Asumimos que el usuario ya está registrado, por lo que usamos cédula como identificador
-const StreamSchema = new mongoose.Schema({
-    enlace: { type: String, required: true },
-    ciudad: { type: String, required: true },
-    cedulaUsuario: { type: String, required: true }, // Referencia a la cédula del usuario
-    estado: { type: String, default: 'pendiente' },
-}, { timestamps: true });
-
-const Stream = mongoose.model('Stream', StreamSchema);
 
 // --- CONFIGURACIÓN DE GREEN API ---
 const ID_INSTANCE = process.env.GREEN_API_ID_INSTANCE;
@@ -79,6 +66,7 @@ async function sendWhatsAppMessage(phone, message) {
     };
 
     try {
+        console.log(`📤 Intentando enviar mensaje a ${chatId}: ${message.substring(0, 50)}...`);
         const response = await axios.post(url, data, {
             headers: {
                 'Content-Type': 'application/json'
@@ -86,7 +74,7 @@ async function sendWhatsAppMessage(phone, message) {
             timeout: 15000 // Timeout de 15 segundos para llamadas externas
         });
         console.log('✅ Mensaje enviado a', chatId, ':', response.data?.id || 'ID no disponible');
-        return { success: true, data: response.data };
+        return { success: true, response.data };
     } catch (error) {
         console.error('❌ Error al enviar mensaje a', chatId, ':', error.response?.data || error.message);
         return { success: false, error: error.message };
@@ -96,6 +84,24 @@ async function sendWhatsAppMessage(phone, message) {
 // Estado de conversación por usuario (en memoria)
 // ⚠️ Para producción, usar una base de datos como Redis sería más robusto
 const userConversationState = new Map();
+
+// Función para extraer el texto del mensaje del webhook de Green API
+function extractMessageText(webhookData) {
+    let text = '';
+
+    // Nuevo formato de webhook (como el de tu log)
+    if (webhookData.typeWebhook === 'incomingMessageReceived' && webhookData.messageData) {
+        if (webhookData.messageData.textMessageData) {
+            text = webhookData.messageData.textMessageData.textMessage || '';
+        }
+    }
+    // Formato antiguo o de simulación (como el de Postman)
+    else if (webhookData.body) {
+        text = webhookData.body;
+    }
+
+    return text.trim();
+}
 
 // --- ENDPOINTS ---
 
@@ -117,13 +123,13 @@ app.post('/admin/register-user', async (req, res) => {
 
     try {
         // --- Validación de Cédula ---
-        // Asumimos formato V-12345678 o E-12345678
-        const cedulaRegex = /^([VE])-(\d{8})$/i;
+        // Permite formatos V12345678 o E12345678 (sin guión)
+        const cedulaRegex = /^([VE])\d{8}$/i;
         const match = cedula.match(cedulaRegex);
 
         if (!match) {
-            await sendWhatsAppMessage(telefono, '❌ Formato de cédula inválido para registro admin. Usa V-12345678 o E-12345678.');
-            return res.status(400).send('❌ Formato de cédula inválido. Usa V-12345678 o E-12345678.');
+            // await sendWhatsAppMessage(telefono, '❌ Formato de cédula inválido para registro admin. Usa V12345678 o E12345678.');
+            return res.status(400).send('❌ Formato de cédula inválido. Usa V12345678 o E12345678.');
         }
 
         const nacionalidad = match[1].toUpperCase();
@@ -133,7 +139,7 @@ app.post('/admin/register-user', async (req, res) => {
         // ✅ Corrección: Eliminar espacio extra en la URL
         const response = await axios.get(`https://api.cedula.com.ve/api/v1`, {
             params: {
-                app_id: '1339', // Considerar usar variables de entorno también para estos
+                app_id: '1339',
                 token: '6a97ffc07f52fa8dc487e4d3a4e69f33',
                 nacionalidad: nacionalidad,
                 cedula: numCedula,
@@ -143,31 +149,28 @@ app.post('/admin/register-user', async (req, res) => {
 
         console.log('📄 Respuesta de API de cédula (admin):', JSON.stringify(response.data, null, 2));
 
-        // Manejo de errores de la API de cédula
         if (response.data.error) {
             console.error('❌ Error de la API de cédula (admin):', response.data.error);
             if (response.data.error.toLowerCase().includes('rate limit')) {
-                await sendWhatsAppMessage(telefono, '⚠️ Límite de solicitudes a la API de cédula alcanzado. Por favor, inténtalo más tarde.');
+                // await sendWhatsAppMessage(telefono, '⚠️ Límite de solicitudes a la API de cédula alcanzado. Por favor, inténtalo más tarde.');
                 return res.status(429).send('⚠️ Límite de solicitudes a la API de cédula alcanzado. Por favor, inténtalo más tarde.');
             } else {
-                await sendWhatsAppMessage(telefono, `❌ La cédula ${cedula} no es válida o no se encontró en los registros oficiales.`);
+                // await sendWhatsAppMessage(telefono, `❌ La cédula ${cedula} no es válida o no se encontró en los registros oficiales.`);
                 return res.status(400).send(`❌ La cédula ${cedula} no es válida o no se encontró.`);
             }
         }
 
-        // Verificar estructura de la respuesta
         if (!response.data.data || !response.data.data.primer_nombre || !response.data.data.primer_apellido) {
             console.error('❌ Estructura de respuesta inesperada de la API de cédula (admin).');
-            await sendWhatsAppMessage(telefono, '❌ Error inesperado al validar la cédula. Inténtalo más tarde.');
+            // await sendWhatsAppMessage(telefono, '❌ Error inesperado al validar la cédula. Inténtalo más tarde.');
             return res.status(500).send('❌ Error inesperado al validar la cédula.');
         }
 
         const apiNombre = response.data.data.primer_nombre;
         const apiApellido = response.data.data.primer_apellido;
 
-        // Comparar nombres (búsqueda parcial para mayor flexibilidad)
         if (!apiNombre.toLowerCase().includes(nombre.toLowerCase()) || !apiApellido.toLowerCase().includes(apellido.toLowerCase())) {
-            await sendWhatsAppMessage(telefono, `❌ Los datos proporcionados (${nombre} ${apellido}) no coinciden con los registros oficiales para la cédula ${cedula}.`);
+            // await sendWhatsAppMessage(telefono, `❌ Los datos proporcionados (${nombre} ${apellido}) no coinciden con los registros oficiales para la cédula ${cedula}.`);
             return res.status(400).send('❌ Los datos no coinciden con los registros oficiales.');
         }
 
@@ -176,14 +179,11 @@ app.post('/admin/register-user', async (req, res) => {
         await newUser.save();
         console.log(`✅ Usuario ${nombre} ${apellido} (${cedula}) registrado exitosamente vía admin.`);
 
-        // Notificar por WhatsApp (opcional)
-        // await sendWhatsAppMessage(telefono, `✅ ¡Registro exitoso vía admin! Bienvenido, ${nombre} ${apellido}.`);
-
         res.status(201).send(`✅ Usuario ${nombre} ${apellido} (${cedula}) registrado exitosamente.`);
     } catch (error) {
-        if (error.code === 11000) { // Error de clave duplicada de MongoDB
+        if (error.code === 11000) {
             console.warn(`⚠️ Intento de registro duplicado para la cédula ${cedula} (admin).`);
-            await sendWhatsAppMessage(telefono, `❌ La cédula ${cedula} ya está registrada en el sistema.`);
+            // await sendWhatsAppMessage(telefono, `❌ La cédula ${cedula} ya está registrada en el sistema.`);
             return res.status(409).send(`❌ La cédula ${cedula} ya está registrada.`);
         }
         console.error('❌ Error al registrar usuario vía admin:', error);
@@ -195,52 +195,53 @@ app.post('/admin/register-user', async (req, res) => {
 app.post('/webhook', async (req, res) => {
     try {
         const message = req.body;
-        console.log("📥 Mensaje recibido en webhook:", JSON.stringify(message, null, 2));
+        console.log("📥 Webhook recibido:", JSON.stringify(message, null, 2)); // Log completo para debug
 
-        // Validación básica del mensaje
-        if (!message || !message.sender || message.sender === 'status@broadcast') {
-            console.log("ℹ️ Mensaje de estado o inválido recibido, ignorando.");
-            return res.status(200).send('OK'); // Responder OK para evitar reintentos de Green API
+        // Validación básica del webhook
+        if (!message) {
+             console.log("⚠️ Webhook recibido sin cuerpo.");
+             return res.status(200).send('OK');
         }
 
+        // Extraer sender y texto del mensaje usando la nueva función
         const from = message.sender; // Ej: "584123456789@c.us"
-        const text = (message.body || '').trim(); // Manejar posibles mensajes sin body
+        const text = extractMessageText(message);
 
-        // Extraer número de teléfono limpio (ej: "04123456789")
-        const phoneNumberClean = from.replace('@c.us', '').startsWith('58') ? from.replace('@c.us', '').replace('58', '0') : from.replace('@c.us', '');
+        // Validación del remitente
+        if (!from || from === 'status@broadcast') {
+            console.log("ℹ️ Mensaje de estado o inválido recibido, ignorando.");
+            return res.status(200).send('OK');
+        }
+
+        // Extraer número de teléfono limpio para usar con sendWhatsAppMessage
         const fullPhoneNumber = from.replace('@c.us', ''); // Para usar con Green API
 
         // --- Manejo del Estado de Conversación ---
         let state = userConversationState.get(from);
         if (!state) {
-            state = { step: 'menu' }; // Inicializar estado si no existe
+            state = { step: 'menu' };
             userConversationState.set(from, state);
         }
 
-        console.log(`💬 Usuario ${fullPhoneNumber} en paso: ${state.step}. Mensaje: "${text}"`);
+        console.log(`💬 Usuario ${fullPhoneNumber} en paso: ${state.step}. Mensaje recibido: "${text}"`);
 
         // --- LÓGICA DE FLUJO DE CONVERSACIÓN ---
 
         // 1. Mensaje de bienvenida o reseteo
         if (text.toLowerCase().includes('hola') || text === '') {
             state.step = 'menu';
-            await sendWhatsAppMessage(fullPhoneNumber, `👋 ¡Hola! Bienvenido a *AQUITA*.\n¿En qué puedo ayudarte?\n\n1️⃣ *Registro* (usuarios)\n2️⃣ *Afiliación* (negocios)\n3️⃣ *Compartir pantalla* de stream\n\nPor favor, responde con el *número* de tu opción.`);
+            await sendWhatsAppMessage(fullPhoneNumber, `👋 ¡Hola! Bienvenido a *AQUITA*.\n¿En qué puedo ayudarte?\n\n1️⃣ *Registro* (usuarios)\n2️⃣ *Afiliación* (negocios)\n\nPor favor, responde con el *número* de tu opción.`);
 
-            // 2. Opción de Registro
+        // 2. Opción de Registro
         } else if (text === '1') {
             state.step = 'nombre';
             await sendWhatsAppMessage(fullPhoneNumber, `📝 *Registro de Usuario*\nPor favor, dime tu *nombre*:`);
 
-            // 3. Opción de Afiliación
+        // 3. Opción de Afiliación
         } else if (text === '2') {
             await sendWhatsAppMessage(fullPhoneNumber, `🏪 *Afiliación de Negocios*\nPara afiliar tu negocio, escríbenos al siguiente número:\n🔗 https://wa.me/584149577176`);
 
-            // 4. Opción de Compartir Stream
-        } else if (text === '3') {
-            state.step = 'stream_enlace';
-            await sendWhatsAppMessage(fullPhoneNumber, `📺 *Compartir Pantalla de Stream*\nPor favor, envíame el *enlace* de tu transmisión en vivo (ej: https://twitch.tv/tunombre):`);
-
-            // --- FLUJO DE REGISTRO (pasos secuenciales) ---
+        // --- FLUJO DE REGISTRO (pasos secuenciales) ---
         } else if (state.step === 'nombre') {
             if (text.length < 2) {
                 await sendWhatsAppMessage(fullPhoneNumber, `❌ El nombre debe tener al menos 2 caracteres. Por favor, inténtalo de nuevo:`);
@@ -257,20 +258,21 @@ app.post('/webhook', async (req, res) => {
             }
             state.apellido = text;
             state.step = 'cedula';
-            await sendWhatsAppMessage(fullPhoneNumber, `Cédula (formato: V-12345678):`);
+            await sendWhatsAppMessage(fullPhoneNumber, `Cédula (formato: V12345678):`);
 
         } else if (state.step === 'cedula') {
-            const cedulaRegex = /^([VE])-(\d{8})$/i;
+            // Permite formatos V12345678 o E12345678 (sin guión)
+            const cedulaRegex = /^([VE])\d{8}$/i;
             const match = text.match(cedulaRegex);
 
             if (!match) {
-                await sendWhatsAppMessage(fullPhoneNumber, `❌ Formato inválido. Por favor, usa el formato *V-12345678* o *E-12345678*:`);
+                await sendWhatsAppMessage(fullPhoneNumber, `❌ Formato inválido. Por favor, usa el formato *V12345678* o *E12345678*:`);
                 return res.status(200).send('OK');
             }
 
             const nacionalidad = match[1].toUpperCase();
             const numCedula = match[2];
-            const fullCedula = `${nacionalidad}-${numCedula}`;
+            const fullCedula = `${nacionalidad}${numCedula}`;
 
             state.cedula = fullCedula;
             state.step = 'telefono';
@@ -354,72 +356,11 @@ app.post('/webhook', async (req, res) => {
                 userConversationState.delete(from);
             }
 
-            // --- FLUJO DE STREAM (pasos secuenciales) ---
-        } else if (state.step === 'stream_enlace') {
-            if (!text.startsWith('http')) {
-                await sendWhatsAppMessage(fullPhoneNumber, `❌ *Enlace inválido*. Debe comenzar con *http://* o *https://*. Por favor, inténtalo de nuevo:`);
-                return res.status(200).send('OK');
-            }
-            state.stream_enlace = text;
-            state.step = 'stream_ciudad';
-            await sendWhatsAppMessage(fullPhoneNumber, `Ciudad donde se encuentra la transmisión:`);
-
-        } else if (state.step === 'stream_ciudad') {
-            if (text.length < 3) {
-                await sendWhatsAppMessage(fullPhoneNumber, `❌ El nombre de la ciudad debe tener al menos 3 caracteres. Por favor, inténtalo de nuevo:`);
-                return res.status(200).send('OK');
-            }
-            state.stream_ciudad = text;
-
-            // Solicitar cédula del usuario que comparte el stream
-            state.step = 'stream_cedula';
-            await sendWhatsAppMessage(fullPhoneNumber, `Para finalizar, por favor envíame tu *número de cédula* (formato: V-12345678) para asociar el stream a tu cuenta:`);
-
-        } else if (state.step === 'stream_cedula') {
-            const cedulaRegex = /^([VE])-(\d{8})$/i;
-            const match = text.match(cedulaRegex);
-
-            if (!match) {
-                await sendWhatsAppMessage(fullPhoneNumber, `❌ Formato inválido. Por favor, usa el formato *V-12345678* o *E-12345678*:`);
-                return res.status(200).send('OK');
-            }
-
-            const nacionalidad = match[1].toUpperCase();
-            const numCedula = match[2];
-            const fullCedula = `${nacionalidad}-${numCedula}`;
-
-            // Verificar si el usuario con esa cédula existe
-            const userExists = await User.findOne({ cedula: fullCedula });
-            if (!userExists) {
-                await sendWhatsAppMessage(fullPhoneNumber, `❌ *No se encontró un usuario registrado* con la cédula *${fullCedula}*. Por favor, regístrate primero usando la opción 1.`);
-                userConversationState.delete(from); // Reiniciar estado
-                return res.status(200).send('OK');
-            }
-
-            // Guardar stream en MongoDB
-            try {
-                const newStream = new Stream({
-                    enlace: state.stream_enlace,
-                    ciudad: state.stream_ciudad,
-                    cedulaUsuario: fullCedula // Asociar al usuario
-                });
-
-                await newStream.save();
-                console.log(`✅ Solicitud de stream recibida de ${fullCedula} (${state.stream_enlace}) para ${state.stream_ciudad}.`);
-                await sendWhatsAppMessage(fullPhoneNumber, `✅ *¡Solicitud recibida!*\nNuestro equipo revisará tu stream (*${state.stream_enlace}*) en *${state.stream_ciudad}* y lo agregará a *AQUITA+* pronto.`);
-
-            } catch (streamError) {
-                console.error('❌ Error al guardar solicitud de stream:', streamError);
-                await sendWhatsAppMessage(fullPhoneNumber, '❌ *Error al guardar la solicitud*. Por favor, inténtalo más tarde.');
-            } finally {
-                userConversationState.delete(from); // Reiniciar estado
-            }
-
-            // --- Manejo de entradas no reconocidas ---
+        // --- Manejo de entradas no reconocidas ---
         } else {
             console.log(`❓ Entrada no reconocida de ${fullPhoneNumber}: "${text}". Estado actual: ${state.step}`);
             // Opcional: Reiniciar o pedir que elija una opción
-            await sendWhatsAppMessage(fullPhoneNumber, `❓ No entendí tu mensaje.\nPor favor, elige una opción:\n1️⃣ Registro\n2️⃣ Afiliación\n3️⃣ Compartir Stream`);
+            await sendWhatsAppMessage(fullPhoneNumber, `❓ No entendí tu mensaje.\nPor favor, elige una opción:\n1️⃣ Registro\n2️⃣ Afiliación`);
             // O reiniciar el flujo:
             // state.step = 'menu';
             // await sendWhatsAppMessage(fullPhoneNumber, `...mensaje de menú...`);
